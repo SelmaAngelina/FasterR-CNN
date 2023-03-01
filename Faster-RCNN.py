@@ -10,6 +10,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tensorflow.keras.preprocessing.image import img_to_array, load_img
 from tensorflow.keras import Model
+import cv2
 
 # this is the file path to the TFRecord
 example_proto = "/Users/selmamusledin/Desktop/CV - Traffic Sign Detection/TFRecords/train.record"
@@ -110,8 +111,6 @@ def get_feature_map(image):
 
 
 
-
-
 """ VISUALIZE ALL FILTERS APPLIED TO THE IMAGE """
 #create a new model that takes the original image as input and outputs the feature map at each convolutional layer
 def get_conv_feature_maps(image):
@@ -138,11 +137,13 @@ def get_conv_feature_maps(image):
     
     return feature_maps, feature_maps_sizes
     
-        
+""" VISUALIZE ALL FILTERS APPLIED TO THE IMAGE END"""      
+
+
 
 #test with first image
 dataset = tf.data.TFRecordDataset(example_proto)
-dataset = dataset.map(parse_tfrecord).skip(3).take(1)
+dataset = dataset.map(parse_tfrecord).skip(1).take(1)
 
 # =============================================================================
 # for image in dataset:
@@ -153,190 +154,8 @@ dataset = dataset.map(parse_tfrecord).skip(3).take(1)
 
 
 """ GENERATE ANCHOR BOXES """
-
-from tqdm import tqdm
-
-def generate_anchors(image, feature_map_size, aspect_ratios, scales, sizes):
-
-    """ return: array of anchor boxes """
-    #compute anchor box dimensions for all ratios and scales at all levels of the feature pyramid
-    anchor_dims_all = []
-    for size in tqdm(sizes,desc='Generating anchor boxes'):
-        anchor_dims=[]
-        for ratio in aspect_ratios:
-            height = np.sqrt(size/ratio)
-            width = size/height
-            dims = np.stack([width,height],axis=-1)
-            for scale in scales:
-                anchor_dims.append(scale * dims)
-        anchor_dims_all.append(np.stack(anchor_dims,axis=-2))
-    
-    #compute the anchor box centers for each feature level
-    num_levels = len(anchor_dims_all)
-    print("Num levels: ", num_levels)
-    anchors_all = []
-    
-    for level in range(num_levels):
-        stride = 2 ** (level + 2)
-        
-        #getting feature height and feature width for each level of the feature pyramid
-        feature_height, feature_width = feature_map_size[level]
-        
-        #get center points
-        rx = np.arange(feature_width,dtype=np.float32) + 0.5
-        ry = np.arange(feature_height,dtype=np.float32) + 0.5
-        
-        centers = np.stack(np.meshgrid(rx,ry),axis=-1) * stride
-        
-        #reshape anchor dimensions and centers for broadcasting
-        anchor_dims = anchor_dims_all[level] #get all anchor_dims for each level of the feature pyramid
-        num_anchors = anchor_dims.shape[0] #get the number of anchors for the first spatial location of the feature pyramid at a given level
-        
-        anchors = np.zeros((feature_height,feature_width,num_anchors,4))
-        anchors[:,:,:,:2] = centers.reshape((feature_height,feature_width,1,2))
-        anchors[:,:,:,2:] = anchor_dims.reshape((1,1,num_anchors,2))
-        anchors_all.append(anchors.reshape((-1,4)))
-        
-    #Convert anchors from center-offset format to corner format
-    if len(image.shape) == 4:
-        image_height, image_width, _ = image.shape[1:]
-    else:
-        image_height, image_width, _ = image.shape
-
-    grid_x,grid_y = np.meshgrid(np.arange(feature_width),np.arange(feature_height))
-    anchor_widths, anchor_heights = anchors_all[0][:, 2], anchors_all[0][:, 3]
-    anchor_centers_x, anchor_centers_y = anchors_all[0][:, 0], anchors_all[0][:, 1]
-    x_min = anchor_centers_x - 0.5 * anchor_widths
-    y_min = anchor_centers_y - 0.5 * anchor_heights
-    x_max = anchor_centers_x + 0.5 * anchor_widths
-    y_max = anchor_centers_y + 0.5 * anchor_heights
-    anchors_all[0] = np.stack([x_min, y_min, x_max, y_max], axis=-1)
-    
-    # Clip anchors to image boundaries
-    anchors_all = np.concatenate(anchors_all, axis=0)
-    anchors_all[:, [0, 2]] = np.clip(anchors_all[:, [0, 2]], 0, image_width - 1)
-    anchors_all[:, [1, 3]] = np.clip(anchors_all[:, [1, 3]], 0, image_height - 1)
-
-    return anchors_all #generates anchor boxes for a given input image and feature map size
-
-
-
-def visualize_anchors_on_feature_map(feature_map, anchors, image_height, image_width):
-    """
-    Visualize the anchor boxes on top of the feature map.
-    """
-    num_anchors = anchors.shape[0]
-    colors = ['b','c','g','k','m','r','w','y','b']
-    for i in tqdm(range(num_anchors),desc="Plotting"):
-        x1,y1,x2,y2 = anchors[i]
-        x1 = max(0,x1)
-        y1 = max(0, y1)
-        x2 = min(image_width - 1, x2)
-        y2 = min(image_height - 1, y2)
-        plt.gca().add_patch(plt.Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False, edgecolor=colors[np.random.randint(0,9)], linewidth=1))
-               
-    #convert the map tensor to an image
-    img_array = feature_map[0,:,:,0] #visualize the first channel of the feature map
-    img_array = (img_array - img_array.min()) / ((img_array.max() - img_array.min())) # normalize the values between 0 and 1
-    img_array = img_to_array(img_array)
-    plt.imshow(img_array)
-    plt.show()
-    
-def rgb_to_bgr(rgb_color):
-    # Convert an RGB color to a BGR color
-    return tuple(np.flip(rgb_color))
-
-
-def resize_anchors(anchors, target_size):
-    """
-    Resizes a list of anchor boxes based on a target size.
-
-    Args:
-        anchors: A list of anchor boxes.
-        target_size: A tuple of (height, width) representing the target size.
-
-    Returns:
-        A list of resized anchor boxes.
-    """
-    resized_anchors = []
-    for anchor in anchors:
-        y_min, x_min, y_max, x_max = anchor
-        h_scale = target_size[0] / (y_max - y_min)
-        w_scale = target_size[1] / (x_max - x_min)
-        y_min *= h_scale
-        x_min *= w_scale
-        y_max *= h_scale
-        x_max *= w_scale
-        resized_anchors.append([y_min, x_min, y_max, x_max])
-        
-    return resized_anchors
-
-
-import cv2     
-def visualize_anchors_on_image(image, anchors, anchor_colors=None, box_thickness=2):
-    """
-    Draws the bounding boxes of the anchors on the original image.
-
-    Args:
-        image: The original image.
-        anchors: A list of anchor boxes.
-        anchor_colors: A list of colors for the anchor boxes. If None, all anchor boxes will be drawn in red.
-        box_thickness: The thickness of the box lines.
-
-    Returns:
-        The image with the anchor boxes drawn on it.
-    """
-    # Rescale the anchors to the original image size
-    image_height, image_width, image_depth = image.shape
-    resized_anchors = resize_anchors(anchors, (image_height,image_width))
-
-    # Define the default anchor color
-    if anchor_colors is None:
-        anchor_colors = [(0, 0, 255)] * len(resized_anchors)
-    else:
-        # Convert the RGB anchor colors to BGR colors
-        anchor_colors = [rgb_to_bgr(color) for color in anchor_colors]
-
-    # Draw the anchor boxes on the image
-    image_with_boxes = image.copy()
-    for anchor, color in zip(resized_anchors, anchor_colors):
-        ymin, xmin, ymax, xmax = anchor
-        xmin = int(xmin * image_width)
-        xmax = int(xmax * image_width)
-        ymin = int(ymin * image_height)
-        ymax = int(ymax * image_height)
-        image_with_boxes = cv2.rectangle(image_with_boxes, (xmin, ymin), (xmax, ymax), color=color, thickness=box_thickness)
-
-    return image_with_boxes
-
-""" NEW """
 ASPECT_RATIOS = [0.5, 1.0, 2.0]
 SCALES = [16,32,64]
-
-# def generate_anchor_boxes(input_image, feature_map_size, aspect_ratios, scales):
-#     #compute stride -> same for height and width
-#     stride = input_image.shape[1] // feature_map_size[0]
-    
-#     #generate anchor box centers
-#     x_centers = tf.range(feature_map_size[1], dtype = tf.float32) * stride + stride/2
-#     y_centers = tf.range(feature_map_size[0], dtype = tf.float32) * stride + stride/2
-    
-#     x_centers, y_centers = tf.meshgrid(x_centers, y_centers)
-    
-#     x_centers = tf.reshape(x_centers,(-1,))
-#     y_centers = tf.reshape(y_centers,(-1,))
-    
-#     #generate anchor box coordinates
-#     num_anchors = len(scales) * len(aspect_ratios)
-#     boxes = tf.zeros((num_anchors * feature_map_size[0] * feature_map_size[1], 4))
-#     idx = 0
-    
-#     for scale in scales:
-#         for aspect_ratio in aspect_ratios:
-#             width = scale * tf.sqrt(aspect_ratio)
-#             height = scale / tf.sqrt(aspect_ratio)
-
-import numpy as np
 
 def generate_anchor_boxes(image,feature_map_shape, input_shape, scales=[32,64,128], aspect_ratios=[0.5, 1.0, 2.0]):
     # Compute the stride based on the feature map shape and input shape
@@ -379,16 +198,17 @@ def generate_anchor_boxes(image,feature_map_shape, input_shape, scales=[32,64,12
             x_max = max(0, min(x_max, input_shape[1] - 1))
             y_max = max(0, min(y_max, input_shape[0] - 1))
 
-            boxes[i * num_anchors + j] = [x_min, y_min, x_max, y_max]
+            #boxes[i * num_anchors + j] = [x_min, y_min, x_max, y_max]
+            boxes[i * num_anchors + j] = [y_min, x_min, y_max, x_max]
             
             
     ################## PLOTTING CENTER POINTS ON ORIGINAL IMAGE ####################
     # Reshape the image to remove the batch dimension
-    #image = tf.reshape(image, (800, 1360, 3))
-    # Display the image
-    #plt.imshow(image)
-    #plt.scatter(center_xy[:,0], center_xy[:,1], s=1, c='r')
-    #plt.show()
+    image = tf.reshape(image, (800, 1360, 3))
+    #Display the image
+    plt.imshow(image)
+    plt.scatter(center_xy[:,0], center_xy[:,1], s=1, c='r')
+    plt.show()
 
 
     return boxes
@@ -464,77 +284,115 @@ def plot_anchor_boxes(anchor_boxes, image):
     ->randomly sample those anchors to form a mini-batch of size 256 (try to maintain a balanced ratio between background and foreground)
 """
 
-def compute_iou(box1,box2):
-    #compute coordinates of intersection rectangle
-    x_min = max(box1[0],box2[0])
-    y_min = max(box1[1],box2[1])
-    
-    x_max = min(box1[2], box2[2])
-    y_max = min(box1[3], box2[3])
-    
-    #check if they at least overlap a little
-    if(x_min < x_max and y_min < y_max):
-        w_overlap = (x_max - x_min)
-        h_overlap = (y_max - y_min)
-        area_overlap = w_overlap * h_overlap
-    else:
-        #in case there is no overlap
-        return 0
-    
-    #-----computing union-----
-    width_box1 = (box1[2] - box1[0])
-    height_box1 = (box1[3] - box1[1])
-    
-    width_box2 = (box2[2] - box2[0])
-    height_box2 = (box2[3] - box2[1])
-    
-    area_box1 = width_box1 * height_box1
-    area_box2 = width_box2 * height_box2
-    
-    area_union_overlap = area_box1 + area_box2
-    
-    area_union = area_union_overlap - area_overlap
-    
-    iou = area_overlap / area_union
-    
+def compute_iou(boxA, boxB):
+    # determine the (x, y)-coordinates of the intersection rectangle
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    # compute the area of intersection rectangle
+    interArea = max(0, xB - xA + 1) * max(0, yB - yA + 1)
+
+    # compute the area of both the prediction and ground-truth
+    # rectangles
+    boxAArea = (boxA[2] - boxA[0] + 1) * (boxA[3] - boxA[1] + 1)
+    boxBArea = (boxB[2] - boxB[0] + 1) * (boxB[3] - boxB[1] + 1)
+
+    # compute the intersection over union by taking the intersection
+    # area and dividing it by the sum of prediction + ground-truth
+    # areas - the intersection area
+    iou = interArea / float(boxAArea + boxBArea - interArea)
+
+    # return the intersection over union value
     return iou
 
 import pandas as pd 
+
 def compute_iou_matrix(bboxes, gt_boxes):
     num_anchors = bboxes.shape[0]
     num_gt_boxes = gt_boxes.shape[0]
     
     iou_matrix = np.zeros((num_anchors,num_gt_boxes))
     
-    # for i in range(num_anchors):
-    #     for j in range(num_gt_boxes):
-    #         iou_matrix[i,j] = compute_iou(bboxes[i], gt_boxes[j])
+    for i in range(num_gt_boxes):
+        for j in range(num_anchors):
+            iou_matrix[j][i] = compute_iou(bboxes[j], gt_boxes[i])
     
-    for i, gt_box in enumerate(gt_boxes):
-        for j, anchor in enumerate(bboxes):
-            iou_matrix[j][i] = compute_iou(anchor, gt_box)
-
+    # initialize a list to store the indices of valid anchor boxes
+    valid_anchors = []
     
-    anchor_idx_list = np.where((bboxes[:, 0] >= 0) &(bboxes[:, 1] >= 0) & (bboxes[:, 2] <= 1360) & (bboxes[:, 3] <= 800))[0]
-    data = {"anchor_idx": anchor_idx_list}
+    # iterate over each anchor box
+    for i in range(num_anchors):
+        # get the coordinates of the anchor box
+        y1, x1, y2, x2 = bboxes[i]
+        
+        # check if the anchor box lies within the image boundaries
+        if x1 >= 0 and y1 >= 0 and x2 <= 1360 and y2 <= 800:
+            valid_anchors.append(i)
     
-    data.update({f"object_{idx}_iou":iou_matrix[:, idx] for idx in range(num_gt_boxes)})
+    # create a dictionary to store the data
+    data = {"anchor_idx": valid_anchors}
     
-    # for each anchor box assign max IOU among all objects in the image
-    data["max_iou"] = iou_matrix.max(axis= 1)
-
-    # for each anchorbox assign ground truth having maximum IOU
-    data["best_gt"] = iou_matrix.argmax(axis= 1)
-
+    # add the IoU scores for each object
+    for idx in range(num_gt_boxes):
+        data[f"object_{idx}_iou"] = iou_matrix[:, idx]
+    
+    # for each anchor box assign max IoU among all objects in the image
+    data["max_iou"] = iou_matrix.max(axis=1)
+    
+    # for each anchor box assign ground truth having maximum IoU
+    data["best_gt"] = iou_matrix.argmax(axis=1)
+    
+    # create a Pandas DataFrame from the data and return it
     df_iou = pd.DataFrame(data)
     
-    return df_iou
+    return df_iou, iou_matrix
 
+""" SAMPLE ANCHORS """
+
+def sample_anchors(iou_df,iou_matrix,anchors):
+    #get anchor boxes having max IoU for each ground truth box
+    best_ious = df_iou.drop(['anchor_idx','max_iou','best_gt'],axis=1).max().values
+    print(f"Top IoUs for each object in the image: {best_ious}")
+    
+    #get anchor box idx having max overlap with ground truth boxes 
+    best_anchors = df_iou.drop(['anchor_idx','max_iou','best_gt'],axis=1).values.argmax(axis=0)
+    print(f"Top anchor boxes index: {best_anchors}")
+    
+    
+    #get all the anchor boxes having same IoU score
+    top_anchors = np.where( iou_matrix == best_ious)[0]
+    print(f"Anchor boxes with same IOU score: {top_anchors}")
+    
+    return top_anchors
+    
+def visualize_top_anchors(img,top_anchors,gt_boxes,anchor_boxes):
+    img_ = np.copy(img)
+    
+    for i in top_anchors:
+        y_min = int(anchor_boxes[i][0])
+        x_min = int(anchor_boxes[i][1])
+        y_max = int(anchor_boxes[i][2])
+        x_max = int(anchor_boxes[i][3])
+        cv2.rectangle(img_,(x_min,y_min), (x_max,y_max), color = (0,255,0), thickness = 2)
+    
+    for i, gt_box in enumerate(gt_boxes):
+        y_min, x_min, y_max, x_max = gt_box
+        x_min, y_min, x_max, y_max = map(int, [x_min, y_min, x_max, y_max])
+        cv2.rectangle(img_,(x_min,y_min), (x_max,y_max),color=(255, 0, 0), thickness = 2)
+    
+    plt.imshow(img_)
+    plt.show()
+
+""" SAMPLE ANCHORS END"""
+        
+    
        
 for image,bboxes in dataset:
     image = tf.expand_dims(image,axis=0)
     #compute_centers(image, sizes, aspect_ratios, scales)
-    #feature_map, feature_map_size = get_conv_feature_maps(image)
+    feature_map, feature_map_size = get_conv_feature_maps(image)
 
     #################### NEW #########################
     
@@ -561,11 +419,19 @@ for image,bboxes in dataset:
    
     # Scale the bounding boxes to match the original image size
     gt_boxes_scaled = gt_boxes * [800, 1360, 800, 1360]
+    gt_boxes_scaled = np.array(gt_boxes_scaled)
     
     #compute_iou_matrix(boxes, gt_boxes)
-    df_iou = compute_iou_matrix(boxes, gt_boxes_scaled)
+    df_iou,iou_matrix = compute_iou_matrix(boxes, gt_boxes_scaled)
     
+    """"
+    # Compute the IoU between every anchor box and every ground truth box
+    iou = compute_iou_matrix2(boxes, gt_boxes_scaled)
     
+    # Plot the IoU matrix
+    plot_iou_matrix(iou)
+    """
+
     #plot gt
     fig, ax = plt.subplots()
     img_data = image[0,...]
@@ -578,6 +444,32 @@ for image,bboxes in dataset:
         rect = plt.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin, linewidth=1, edgecolor='r', facecolor='none')
         ax.add_patch(rect)
     plt.show()
+    
+    top_anchors = sample_anchors(df_iou, iou_matrix,boxes)
+    visualize_top_anchors(img_data, top_anchors, gt_boxes_scaled, boxes)
+    
+    # import cv2
+
+    # img_data = np.array(img_data)
+    # # Draw rectangles around anchors and ground truth boxes
+    # for i, anchor in enumerate(boxes):
+    #     x_min, y_min, x_max, y_max = map(int, anchor)
+    #     cv2.rectangle(img_data, (x_min, y_min), (x_max, y_max), (255,0,0), 2)
+
+    # for i, gt_box in enumerate(gt_boxes_scaled):
+    #     x_min, y_min, x_max, y_max = map(int, gt_box)
+    #     print("GTBOXES:")
+    #     print(x_min, y_min, x_max, y_max)
+    #     cv2.rectangle(img_data, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+
+    # # Display image
+    # cv2.imshow('Anchors and Ground Truth Boxes', img_data)
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
+
+    
+
+
     
     
     
